@@ -1,6 +1,7 @@
 package ical
 
 import (
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -8,151 +9,6 @@ import (
 	ics "github.com/arran4/golang-ical"
 	"github.com/teambition/rrule-go"
 )
-
-// windowsToIANA maps Microsoft Windows timezone identifiers to IANA zone names.
-// Exchange and Outlook emit TZID values like "Pacific Standard Time", which
-// time.LoadLocation cannot resolve. Derived from the CLDR windowsZones mapping.
-var windowsToIANA = map[string]string{
-	"Afghanistan Standard Time":       "Asia/Kabul",
-	"Alaskan Standard Time":           "America/Anchorage",
-	"Aleutian Standard Time":          "America/Adak",
-	"Altai Standard Time":             "Asia/Barnaul",
-	"Arab Standard Time":              "Asia/Riyadh",
-	"Arabian Standard Time":           "Asia/Dubai",
-	"Arabic Standard Time":            "Asia/Baghdad",
-	"Argentina Standard Time":         "America/Argentina/Buenos_Aires",
-	"Astrakhan Standard Time":         "Europe/Astrakhan",
-	"Atlantic Standard Time":          "America/Halifax",
-	"AUS Central Standard Time":       "Australia/Darwin",
-	"Aus Central W. Standard Time":    "Australia/Eucla",
-	"AUS Eastern Standard Time":       "Australia/Sydney",
-	"Azerbaijan Standard Time":        "Asia/Baku",
-	"Azores Standard Time":            "Atlantic/Azores",
-	"Bahia Standard Time":             "America/Bahia",
-	"Bangladesh Standard Time":        "Asia/Dhaka",
-	"Belarus Standard Time":           "Europe/Minsk",
-	"Bougainville Standard Time":      "Pacific/Bougainville",
-	"Canada Central Standard Time":    "America/Regina",
-	"Cape Verde Standard Time":        "Atlantic/Cape_Verde",
-	"Caucasus Standard Time":          "Asia/Yerevan",
-	"Cen. Australia Standard Time":    "Australia/Adelaide",
-	"Central America Standard Time":   "America/Guatemala",
-	"Central Asia Standard Time":      "Asia/Almaty",
-	"Central Brazilian Standard Time": "America/Cuiaba",
-	"Central Europe Standard Time":    "Europe/Budapest",
-	"Central European Standard Time":  "Europe/Warsaw",
-	"Central Pacific Standard Time":   "Pacific/Guadalcanal",
-	"Central Standard Time":           "America/Chicago",
-	"Central Standard Time (Mexico)":  "America/Mexico_City",
-	"Chatham Islands Standard Time":   "Pacific/Chatham",
-	"China Standard Time":             "Asia/Shanghai",
-	"Cuba Standard Time":              "America/Havana",
-	"Dateline Standard Time":          "Etc/GMT+12",
-	"E. Africa Standard Time":         "Africa/Nairobi",
-	"E. Australia Standard Time":      "Australia/Brisbane",
-	"E. Europe Standard Time":         "Europe/Chisinau",
-	"E. South America Standard Time":  "America/Sao_Paulo",
-	"Easter Island Standard Time":     "Pacific/Easter",
-	"Eastern Standard Time":           "America/New_York",
-	"Eastern Standard Time (Mexico)":  "America/Cancun",
-	"Egypt Standard Time":             "Africa/Cairo",
-	"Ekaterinburg Standard Time":      "Asia/Yekaterinburg",
-	"Fiji Standard Time":              "Pacific/Fiji",
-	"FLE Standard Time":               "Europe/Kiev",
-	"Georgian Standard Time":          "Asia/Tbilisi",
-	"GMT Standard Time":               "Europe/London",
-	"Greenland Standard Time":         "America/Godthab",
-	"Greenwich Standard Time":         "Atlantic/Reykjavik",
-	"GTB Standard Time":               "Europe/Bucharest",
-	"Haiti Standard Time":             "America/Port-au-Prince",
-	"Hawaiian Standard Time":          "Pacific/Honolulu",
-	"India Standard Time":             "Asia/Calcutta",
-	"Iran Standard Time":              "Asia/Tehran",
-	"Israel Standard Time":            "Asia/Jerusalem",
-	"Jordan Standard Time":            "Asia/Amman",
-	"Kaliningrad Standard Time":       "Europe/Kaliningrad",
-	"Korea Standard Time":             "Asia/Seoul",
-	"Libya Standard Time":             "Africa/Tripoli",
-	"Line Islands Standard Time":      "Pacific/Kiritimati",
-	"Lord Howe Standard Time":         "Australia/Lord_Howe",
-	"Magadan Standard Time":           "Asia/Magadan",
-	"Magallanes Standard Time":        "America/Punta_Arenas",
-	"Marquesas Standard Time":         "Pacific/Marquesas",
-	"Mauritius Standard Time":         "Indian/Mauritius",
-	"Middle East Standard Time":       "Asia/Beirut",
-	"Montevideo Standard Time":        "America/Montevideo",
-	"Morocco Standard Time":           "Africa/Casablanca",
-	"Mountain Standard Time":          "America/Denver",
-	"Mountain Standard Time (Mexico)": "America/Mazatlan",
-	"Myanmar Standard Time":           "Asia/Rangoon",
-	"N. Central Asia Standard Time":   "Asia/Novosibirsk",
-	"Namibia Standard Time":           "Africa/Windhoek",
-	"Nepal Standard Time":             "Asia/Katmandu",
-	"New Zealand Standard Time":       "Pacific/Auckland",
-	"Newfoundland Standard Time":      "America/St_Johns",
-	"Norfolk Standard Time":           "Pacific/Norfolk",
-	"North Asia East Standard Time":   "Asia/Irkutsk",
-	"North Asia Standard Time":        "Asia/Krasnoyarsk",
-	"North Korea Standard Time":       "Asia/Pyongyang",
-	"Omsk Standard Time":              "Asia/Omsk",
-	"Pacific SA Standard Time":        "America/Santiago",
-	"Pacific Standard Time":           "America/Los_Angeles",
-	"Pacific Standard Time (Mexico)":  "America/Tijuana",
-	"Pakistan Standard Time":          "Asia/Karachi",
-	"Paraguay Standard Time":          "America/Asuncion",
-	"Qyzylorda Standard Time":         "Asia/Qyzylorda",
-	"Romance Standard Time":           "Europe/Paris",
-	"Russia Time Zone 3":              "Europe/Samara",
-	"Russia Time Zone 10":             "Asia/Srednekolymsk",
-	"Russia Time Zone 11":             "Asia/Kamchatka",
-	"Russian Standard Time":           "Europe/Moscow",
-	"SA Eastern Standard Time":        "America/Cayenne",
-	"SA Pacific Standard Time":        "America/Bogota",
-	"SA Western Standard Time":        "America/La_Paz",
-	"Saint Pierre Standard Time":      "America/Miquelon",
-	"Sakhalin Standard Time":          "Asia/Sakhalin",
-	"Samoa Standard Time":             "Pacific/Apia",
-	"Sao Tome Standard Time":          "Africa/Sao_Tome",
-	"Saratov Standard Time":           "Europe/Saratov",
-	"SE Asia Standard Time":           "Asia/Bangkok",
-	"Singapore Standard Time":         "Asia/Singapore",
-	"South Africa Standard Time":      "Africa/Johannesburg",
-	"South Sudan Standard Time":       "Africa/Juba",
-	"Sri Lanka Standard Time":         "Asia/Colombo",
-	"Sudan Standard Time":             "Africa/Khartoum",
-	"Syria Standard Time":             "Asia/Damascus",
-	"Taipei Standard Time":            "Asia/Taipei",
-	"Tasmania Standard Time":          "Australia/Hobart",
-	"Tocantins Standard Time":         "America/Araguaina",
-	"Tokyo Standard Time":             "Asia/Tokyo",
-	"Tomsk Standard Time":             "Asia/Tomsk",
-	"Tonga Standard Time":             "Pacific/Tongatapu",
-	"Transbaikal Standard Time":       "Asia/Chita",
-	"Turkey Standard Time":            "Europe/Istanbul",
-	"Turks And Caicos Standard Time":  "America/Grand_Turk",
-	"Ulaanbaatar Standard Time":       "Asia/Ulaanbaatar",
-	"US Eastern Standard Time":        "America/Indianapolis",
-	"US Mountain Standard Time":       "America/Phoenix",
-	"UTC":                             "Etc/UTC",
-	"UTC+12":                          "Etc/GMT-12",
-	"UTC+13":                          "Etc/GMT-13",
-	"UTC-02":                          "Etc/GMT+2",
-	"UTC-08":                          "Etc/GMT+8",
-	"UTC-09":                          "Etc/GMT+9",
-	"UTC-11":                          "Etc/GMT+11",
-	"Venezuela Standard Time":         "America/Caracas",
-	"Vladivostok Standard Time":       "Asia/Vladivostok",
-	"Volgograd Standard Time":         "Europe/Volgograd",
-	"W. Australia Standard Time":      "Australia/Perth",
-	"W. Central Africa Standard Time": "Africa/Lagos",
-	"W. Europe Standard Time":         "Europe/Berlin",
-	"W. Mongolia Standard Time":       "Asia/Hovd",
-	"West Asia Standard Time":         "Asia/Tashkent",
-	"West Bank Standard Time":         "Asia/Hebron",
-	"West Pacific Standard Time":      "Pacific/Port_Moresby",
-	"Yakutsk Standard Time":           "Asia/Yakutsk",
-	"Yukon Standard Time":             "America/Whitehorse",
-}
 
 // tzTransition is one STANDARD or DAYLIGHT rule inside a VTIMEZONE component.
 type tzTransition struct {
@@ -175,12 +31,14 @@ type vtimezone struct {
 type tzResolver struct {
 	cache      map[string]*time.Location
 	vtimezones map[string]*vtimezone
+	unresolved map[string]bool
 }
 
 func newTZResolver(cal *ics.Calendar) *tzResolver {
 	r := &tzResolver{
 		cache:      make(map[string]*time.Location),
 		vtimezones: make(map[string]*vtimezone),
+		unresolved: make(map[string]bool),
 	}
 	for _, comp := range cal.Components {
 		vtz, ok := comp.(*ics.VTimezone)
@@ -298,7 +156,16 @@ func (t tzTransition) latestOccurrence(wall time.Time) (time.Time, bool) {
 	if !t.start.IsZero() {
 		h, m, s = t.start.Clock()
 	}
-	anchor := time.Date(wall.Year()-1, time.January, 1, h, m, s, 0, time.UTC)
+
+	// BYMONTH and BYDAY fully determine the date, so January is as good an
+	// anchor as any. Without BYMONTH the rule falls back to DTSTART's own month
+	// and day to place the transition, and anchoring to January would move it
+	// there — pinning the zone to one offset for the rest of the year.
+	month, day := time.January, 1
+	if len(t.opt.Bymonth) == 0 && !t.start.IsZero() {
+		month, day = t.start.Month(), t.start.Day()
+	}
+	anchor := time.Date(wall.Year()-1, month, day, h, m, s, 0, time.UTC)
 
 	opt := *t.opt
 	opt.Dtstart = anchor
@@ -343,12 +210,21 @@ func (v *vtimezone) offsetAt(wall time.Time) int {
 	return best
 }
 
-// load resolves a TZID to a time.Location, trying IANA names first, then the
-// Windows mapping, then any VTIMEZONE definition embedded in the feed. It
-// returns nil when the zone cannot be determined.
+// load resolves a TZID to a time.Location, or nil when it cannot be determined.
+//
+// There is no Windows-to-IANA name table here, and deliberately so. Exchange
+// names its zones "Pacific Standard Time", which time.LoadLocation cannot
+// resolve — but it also ships a VTIMEZONE defining every TZID it references, so
+// the feed answers the question about itself. A static table is a second,
+// staler copy of that answer: it has to be extended for every zone nobody
+// thought to enumerate, and its entries rot as the IANA database renames zones.
+//
+// IANA is still tried first, because a real location carries the full history
+// of a zone and knows which local times never existed. The feed's own rules are
+// the fallback, which is the case the table used to cover.
 //
 // The wall argument is the local time being interpreted; it is only used to pick
-// the correct offset from a VTIMEZONE fallback, which has no single fixed offset.
+// the offset from a VTIMEZONE, which has no single fixed one.
 func (r *tzResolver) load(tzid string, wall time.Time) *time.Location {
 	if tzid == "" {
 		return nil
@@ -361,12 +237,6 @@ func (r *tzResolver) load(tzid string, wall time.Time) *time.Location {
 		r.cache[tzid] = loc
 		return loc
 	}
-	if iana, ok := windowsToIANA[tzid]; ok {
-		if loc, err := time.LoadLocation(iana); err == nil {
-			r.cache[tzid] = loc
-			return loc
-		}
-	}
 	// Some feeds prefix TZIDs, e.g. "/mozilla.org/20050126_1/Europe/Berlin".
 	if idx := strings.LastIndex(tzid, "/"); idx >= 0 && idx < len(tzid)-1 {
 		if loc, err := time.LoadLocation(tzid[idx+1:]); err == nil {
@@ -375,10 +245,43 @@ func (r *tzResolver) load(tzid string, wall time.Time) *time.Location {
 		}
 	}
 
-	// Fall back to the offsets declared by the feed's own VTIMEZONE component.
-	// These are not cached: the offset is date-dependent because of DST.
+	// The offsets the feed declares for itself. Not cached: the offset is
+	// date-dependent because of DST, so it is resolved per instant.
 	if vtz, ok := r.vtimezones[tzid]; ok {
 		return time.FixedZone(tzid, vtz.offsetAt(wall))
 	}
+
+	// Neither IANA nor the feed can place this zone. Recorded rather than
+	// passed over, because the caller's fallback to local time produces a
+	// plausible-looking wrong answer.
+	r.unresolved[tzid] = true
 	return nil
+}
+
+// Unresolved reports the TZIDs that could not be placed, so a feed that is
+// being silently misread is visible as something other than odd-looking times.
+func (r *tzResolver) Unresolved() []string {
+	out := make([]string, 0, len(r.unresolved))
+	for tzid := range r.unresolved {
+		out = append(out, tzid)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// resolveWall places a wall-clock reading on the timeline in the zone a TZID
+// names, falling back to local time when the zone cannot be determined.
+//
+// Every call resolves the offset afresh for the date being placed, which is
+// what keeps a recurring series on its local hour. The alternative — resolving
+// once and reusing the location — silently freezes the offset, because the
+// VTIMEZONE fallback can only ever return a fixed zone: it answers for the one
+// instant it was asked about.
+func (r *tzResolver) resolveWall(wall time.Time, tzid string) time.Time {
+	loc := r.load(tzid, wall)
+	if loc == nil {
+		loc = time.Local
+	}
+	return time.Date(wall.Year(), wall.Month(), wall.Day(),
+		wall.Hour(), wall.Minute(), wall.Second(), wall.Nanosecond(), loc)
 }

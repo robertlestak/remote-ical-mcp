@@ -20,24 +20,32 @@ type Server struct {
 	byName    map[string]ical.RemoteCalendar
 }
 
-func (s *Server) resolveCalendar(calendar string) (string, error) {
+// resolveCalendar turns a tool argument into a URL to fetch, and reports the
+// fetch options that go with it.
+//
+// A configured calendar is trusted: the operator chose it, and it may well be
+// self-hosted on a private address. A URL supplied in the tool call is not —
+// the model chooses that, so it is held to public addresses only. Without the
+// distinction the server is a way to reach whatever it can reach and read the
+// results back through the tool response.
+func (s *Server) resolveCalendar(calendar string) (string, ical.FetchOptions, error) {
 	if calendar == "" {
-		return "", fmt.Errorf("calendar is required: pass a configured calendar name or an http/https ICS URL")
+		return "", ical.FetchOptions{}, fmt.Errorf("calendar is required: pass a configured calendar name or an http/https ICS URL")
 	}
 
 	// Check if it's a configured calendar name.
 	if cal, ok := s.byName[calendar]; ok {
-		return cal.URL, nil
+		return cal.URL, ical.FetchOptions{AllowPrivateHosts: true}, nil
 	}
 
 	// Validate as URL.
 	u, err := url.Parse(calendar)
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
-		return "", fmt.Errorf("unknown calendar %q: must be a configured calendar name (%s) or a valid http/https URL",
+		return "", ical.FetchOptions{}, fmt.Errorf("unknown calendar %q: must be a configured calendar name (%s) or a valid http/https URL",
 			calendar, strings.Join(s.calendarNames(), ", "))
 	}
 
-	return calendar, nil
+	return calendar, ical.FetchOptions{}, nil
 }
 
 func (s *Server) calendarNames() []string {
@@ -147,7 +155,7 @@ func (s *Server) registerTools() {
 		Name:        "list_events",
 		Description: "Fetch events from a remote ICS calendar. Recurring events are expanded into individual occurrences within the requested date range, and events overlapping the range boundaries are included.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args listEventsArgs) (*mcp.CallToolResult, any, error) {
-		calURL, err := s.resolveCalendar(args.Calendar)
+		calURL, fetchOpts, err := s.resolveCalendar(args.Calendar)
 		if err != nil {
 			return toolError(err)
 		}
@@ -157,7 +165,7 @@ func (s *Server) registerTools() {
 			return toolError(err)
 		}
 
-		events, err := ical.FetchAndParse(calURL, startDate, endDate)
+		events, err := ical.FetchAndParse(ctx, calURL, fetchOpts, startDate, endDate)
 		if err != nil {
 			return toolError(err)
 		}
@@ -176,7 +184,7 @@ func (s *Server) registerTools() {
 		Name:        "search_events",
 		Description: "Search for events matching a query string in summary, description, or location. Recurring events are expanded into individual occurrences before matching.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args searchEventsArgs) (*mcp.CallToolResult, any, error) {
-		calURL, err := s.resolveCalendar(args.Calendar)
+		calURL, fetchOpts, err := s.resolveCalendar(args.Calendar)
 		if err != nil {
 			return toolError(err)
 		}
@@ -186,7 +194,7 @@ func (s *Server) registerTools() {
 			return toolError(err)
 		}
 
-		events, err := ical.FetchAndParse(calURL, startDate, endDate)
+		events, err := ical.FetchAndParse(ctx, calURL, fetchOpts, startDate, endDate)
 		if err != nil {
 			return toolError(err)
 		}

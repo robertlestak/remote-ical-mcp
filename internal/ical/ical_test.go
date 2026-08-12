@@ -5,6 +5,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	ics "github.com/arran4/golang-ical"
 )
 
 // wrap builds a minimal VCALENDAR around the supplied component bodies.
@@ -49,22 +51,62 @@ func starts(events []Event) []string {
 	return out
 }
 
+// vtimezone builds the component Exchange ships alongside its Windows zone
+// names. Rules are dated to 1601 and the offsets given in the ±HHMM form, both
+// verbatim as Exchange writes them.
+func vtimezoneFor(tzid, stdOffset, stdRule, dstOffset, dstRule string) string {
+	out := "BEGIN:VTIMEZONE\r\nTZID:" + tzid + "\r\n" +
+		"BEGIN:STANDARD\r\nDTSTART:16010101T020000\r\n" +
+		"TZOFFSETFROM:" + stdOffset + "\r\nTZOFFSETTO:" + stdOffset + "\r\n"
+	if stdRule != "" {
+		out += "RRULE:" + stdRule + "\r\n"
+	}
+	out += "END:STANDARD\r\n"
+	if dstOffset != "" {
+		out += "BEGIN:DAYLIGHT\r\nDTSTART:16010101T020000\r\n" +
+			"TZOFFSETFROM:" + stdOffset + "\r\nTZOFFSETTO:" + dstOffset + "\r\n"
+		if dstRule != "" {
+			out += "RRULE:" + dstRule + "\r\n"
+		}
+		out += "END:DAYLIGHT\r\n"
+	}
+	return out + "END:VTIMEZONE\r\n"
+}
+
 // TestWindowsTimezone covers the bug that silently zeroed every event in feeds
 // produced by Exchange, which emits Windows zone IDs rather than IANA names.
+//
+// The names are resolved from the VTIMEZONE the feed publishes for them rather
+// than from a name table, so each case carries the definition Exchange sends.
 func TestWindowsTimezone(t *testing.T) {
+	usStd := "FREQ=YEARLY;INTERVAL=1;BYDAY=1SU;BYMONTH=11"
+	usDst := "FREQ=YEARLY;INTERVAL=1;BYDAY=2SU;BYMONTH=3"
+	euStd := "FREQ=YEARLY;INTERVAL=1;BYDAY=-1SU;BYMONTH=10"
+	euDst := "FREQ=YEARLY;INTERVAL=1;BYDAY=-1SU;BYMONTH=3"
+
 	tests := []struct {
 		tzid string
+		vtz  string
 		want string
 	}{
-		{"Pacific Standard Time", "2026-08-10T17:00:00Z"}, // PDT, UTC-7
-		{"Eastern Standard Time", "2026-08-10T14:00:00Z"}, // EDT, UTC-4
-		{"India Standard Time", "2026-08-10T04:30:00Z"},   // IST, UTC+5:30
-		{"GMT Standard Time", "2026-08-10T09:00:00Z"},     // BST, UTC+1
-		{"America/Los_Angeles", "2026-08-10T17:00:00Z"},   // IANA still works
+		{"Pacific Standard Time",
+			vtimezoneFor("Pacific Standard Time", "-0800", usStd, "-0700", usDst),
+			"2026-08-10T17:00:00Z"}, // PDT, UTC-7
+		{"Eastern Standard Time",
+			vtimezoneFor("Eastern Standard Time", "-0500", usStd, "-0400", usDst),
+			"2026-08-10T14:00:00Z"}, // EDT, UTC-4
+		{"India Standard Time",
+			vtimezoneFor("India Standard Time", "+0530", "", "", ""),
+			"2026-08-10T04:30:00Z"}, // IST, UTC+5:30, no DST
+		{"GMT Standard Time",
+			vtimezoneFor("GMT Standard Time", "+0000", euStd, "+0100", euDst),
+			"2026-08-10T09:00:00Z"}, // BST, UTC+1
+		// An IANA name needs no definition in the feed at all.
+		{"America/Los_Angeles", "", "2026-08-10T17:00:00Z"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.tzid, func(t *testing.T) {
-			data := wrap(event(
+			data := wrap(tc.vtz, event(
 				"UID:tz-1",
 				"SUMMARY:Meeting",
 				"DTSTART;TZID="+tc.tzid+":20260810T100000",
@@ -81,6 +123,29 @@ func TestWindowsTimezone(t *testing.T) {
 				t.Error("start is the zero time; timezone resolution failed")
 			}
 		})
+	}
+}
+
+// A zone the feed neither names portably nor defines cannot be placed. The
+// event still lands on roughly the right day via local time, but the guess is
+// recorded rather than passed off as an answer.
+func TestUnresolvableZoneIsRecorded(t *testing.T) {
+	cal, err := ics.ParseCalendar(strings.NewReader(string(wrap(event(
+		"UID:tz-2",
+		"SUMMARY:Meeting",
+		"DTSTART;TZID=Pacific Standard Time:20260810T100000",
+		"DTEND;TZID=Pacific Standard Time:20260810T110000",
+	)))))
+	if err != nil {
+		t.Fatalf("parsing: %v", err)
+	}
+
+	tz := newTZResolver(cal)
+	if loc := tz.load("Pacific Standard Time", time.Now()); loc != nil {
+		t.Errorf("load returned %v for a zone with no definition in the feed", loc)
+	}
+	if got := tz.Unresolved(); len(got) != 1 || got[0] != "Pacific Standard Time" {
+		t.Errorf("Unresolved() = %v, want the zone that could not be placed", got)
 	}
 }
 

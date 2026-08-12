@@ -2,14 +2,18 @@ package ical
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	ics "github.com/arran4/golang-ical"
+	log "github.com/sirupsen/logrus"
 	"github.com/teambition/rrule-go"
 )
 
@@ -27,6 +31,70 @@ const (
 
 // httpTimeout caps the fetch of a remote calendar.
 const httpTimeout = 30 * time.Second
+
+// maxCalendarBytes caps how much of a response is read. A published calendar is
+// a few megabytes at most; without a bound, one oversized or hostile feed can
+// exhaust memory for the whole server.
+const maxCalendarBytes = 64 << 20
+
+// FetchOptions controls how a calendar is retrieved.
+type FetchOptions struct {
+	// AllowPrivateHosts permits connecting to loopback, link-local and private
+	// addresses. Configured calendars may legitimately be self-hosted, so they
+	// set this; a URL that arrived in a tool call must not, or the server
+	// becomes a way to probe the network it runs in and read the results back.
+	AllowPrivateHosts bool
+}
+
+// errPrivateAddress reports a refusal to connect to a non-public address.
+type errPrivateAddress struct{ addr string }
+
+func (e errPrivateAddress) Error() string {
+	return fmt.Sprintf("refusing to fetch from non-public address %s: "+
+		"only configured calendars may point at private hosts", e.addr)
+}
+
+// newHTTPClient builds a client that optionally refuses non-public addresses.
+//
+// The check runs in the dialer's Control hook rather than on the URL, so it sees
+// the address actually being connected to. Checking the hostname up front would
+// miss a redirect to an internal host, and would be defeated by a name that
+// resolves publicly once and privately on the second lookup.
+func newHTTPClient(opts FetchOptions) *http.Client {
+	dialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
+	if !opts.AllowPrivateHosts {
+		dialer.Control = func(network, address string, _ syscall.RawConn) error {
+			host, _, err := net.SplitHostPort(address)
+			if err != nil {
+				return err
+			}
+			ip := net.ParseIP(host)
+			if ip == nil || !isPublicIP(ip) {
+				return errPrivateAddress{addr: host}
+			}
+			return nil
+		}
+	}
+
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.DialContext = dialer.DialContext
+	return &http.Client{Timeout: httpTimeout, Transport: transport}
+}
+
+// isPublicIP reports whether an address is routable on the public internet.
+func isPublicIP(ip net.IP) bool {
+	if ip.IsLoopback() || ip.IsPrivate() || ip.IsUnspecified() ||
+		ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
+		ip.IsInterfaceLocalMulticast() || ip.IsMulticast() {
+		return false
+	}
+	// Carrier-grade NAT, 100.64.0.0/10. Not private by Go's definition, but not
+	// somewhere a published calendar is served from either.
+	if v4 := ip.To4(); v4 != nil && v4[0] == 100 && v4[1] >= 64 && v4[1] <= 127 {
+		return false
+	}
+	return true
+}
 
 type RemoteCalendar struct {
 	URL         string `json:"url" yaml:"url"`
@@ -55,19 +123,81 @@ type Event struct {
 // eventTemplate holds the timezone-resolved fields of a single VEVENT before
 // recurrence expansion.
 type eventTemplate struct {
-	base         Event
-	start        time.Time
-	duration     time.Duration
-	rrule        string
-	exdates      map[time.Time]bool
-	rdates       []time.Time
+	base     Event
+	start    time.Time
+	duration time.Duration
+	rrule    string
+	exdates  map[time.Time]bool
+	rdates   []time.Time
+	// tzid, startWall and wallBased carry DTSTART as it was written when it
+	// named a zone, so a series can be repeated on the wall clock and each
+	// occurrence placed at the offset in force on its own date.
+	tzid         string
+	startWall    time.Time
+	wallBased    bool
 	recurrenceID time.Time
 	hasRecurID   bool
+	// thisAndFuture is RANGE=THISANDFUTURE: the edit reaches every later
+	// occurrence too, not only the slot it names.
+	thisAndFuture bool
 }
 
-func Fetch(url string) ([]byte, error) {
-	client := &http.Client{Timeout: httpTimeout}
-	resp, err := client.Get(url)
+// overrideSet holds the edited instances of one series, split by how far each
+// edit reaches.
+//
+// RECURRENCE-ID names the slot an instance replaces. With RANGE=THISANDFUTURE
+// it replaces that slot and every later one — what a client writes when you
+// choose "this and all following events" — so the two kinds cannot be looked up
+// the same way: one matches an instant exactly, the other governs a range.
+type overrideSet struct {
+	single map[time.Time]*eventTemplate
+	future []*eventTemplate // ascending by recurrenceID
+}
+
+func newOverrideSet() *overrideSet {
+	return &overrideSet{single: make(map[time.Time]*eventTemplate)}
+}
+
+func (s *overrideSet) add(tpl *eventTemplate) {
+	if tpl.thisAndFuture {
+		s.future = append(s.future, tpl)
+		return
+	}
+	s.single[tpl.recurrenceID.UTC()] = tpl
+}
+
+func (s *overrideSet) sortFuture() {
+	sort.Slice(s.future, func(i, j int) bool {
+		return s.future[i].recurrenceID.Before(s.future[j].recurrenceID)
+	})
+}
+
+// governing returns the THISANDFUTURE edit in force at an occurrence: the last
+// one that begins at or before it, so a later edit supersedes an earlier one.
+func (s *overrideSet) governing(at time.Time) (*eventTemplate, bool) {
+	var found *eventTemplate
+	for _, ov := range s.future {
+		if ov.recurrenceID.After(at) {
+			break
+		}
+		found = ov
+	}
+	return found, found != nil
+}
+
+// shift is how far this edit moved its own slot, and therefore how far it moves
+// every slot it governs: "move the whole series an hour later from here on".
+func (t *eventTemplate) shift() time.Duration {
+	return t.start.Sub(t.recurrenceID)
+}
+
+func Fetch(ctx context.Context, url string, opts FetchOptions) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := newHTTPClient(opts).Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -77,9 +207,12 @@ func Fetch(url string) ([]byte, error) {
 		return nil, fmt.Errorf("calendar fetch returned HTTP %d %s", resp.StatusCode, http.StatusText(resp.StatusCode))
 	}
 
-	data, err := io.ReadAll(resp.Body)
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxCalendarBytes+1))
 	if err != nil {
 		return nil, err
+	}
+	if len(data) > maxCalendarBytes {
+		return nil, fmt.Errorf("calendar is larger than the %d MiB limit", maxCalendarBytes>>20)
 	}
 	if len(bytes.TrimSpace(data)) == 0 {
 		return nil, fmt.Errorf("calendar fetch returned an empty body")
@@ -90,8 +223,8 @@ func Fetch(url string) ([]byte, error) {
 	return data, nil
 }
 
-func FetchAndParse(url string, startDate, endDate *time.Time) ([]Event, error) {
-	data, err := Fetch(url)
+func FetchAndParse(ctx context.Context, url string, opts FetchOptions, startDate, endDate *time.Time) ([]Event, error) {
+	data, err := Fetch(ctx, url, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -124,8 +257,8 @@ func Parse(data []byte, startDate, endDate *time.Time) ([]Event, error) {
 	}
 
 	var masters []*eventTemplate
-	// overrides maps UID -> recurrence instant -> the modified instance.
-	overrides := make(map[string]map[time.Time]*eventTemplate)
+	overrides := make(map[string]*overrideSet)
+	hasMaster := make(map[string]bool)
 
 	for _, ev := range cal.Events() {
 		tpl, err := buildTemplate(ev, tz)
@@ -136,37 +269,61 @@ func Parse(data []byte, startDate, endDate *time.Time) ([]Event, error) {
 		if tpl.hasRecurID {
 			uid := tpl.base.UID
 			if overrides[uid] == nil {
-				overrides[uid] = make(map[time.Time]*eventTemplate)
+				overrides[uid] = newOverrideSet()
 			}
-			overrides[uid][tpl.recurrenceID.UTC()] = tpl
+			overrides[uid].add(tpl)
 			continue
 		}
 		masters = append(masters, tpl)
+		hasMaster[tpl.base.UID] = true
+	}
+	for _, set := range overrides {
+		set.sortFuture()
 	}
 
 	events := []Event{}
 	seenOverrides := make(map[string]map[time.Time]bool)
 
 	for _, tpl := range masters {
-		occurrences := expand(tpl, windowStart, windowEnd)
+		set := overrides[tpl.base.UID]
+		occurrences := expand(tpl, tz, windowStart, windowEnd)
 		for _, occ := range occurrences {
 			inst := occ.UTC()
 
-			// A RECURRENCE-ID instance replaces the generated occurrence.
-			if byUID, ok := overrides[tpl.base.UID]; ok {
-				if ov, ok := byUID[inst]; ok {
+			source, start := tpl, occ
+			if set != nil {
+				gov, governed := set.governing(occ)
+
+				// The slot a single override names. Normally that is the
+				// instant the rule generated, but once a THISANDFUTURE edit has
+				// moved the series, clients differ over whether a later
+				// RECURRENCE-ID names the original slot or the moved one. Both
+				// identify the same occurrence, so both are accepted.
+				key := inst
+				ov, ok := set.single[key]
+				if !ok && governed {
+					key = occ.Add(gov.shift()).UTC()
+					ov, ok = set.single[key]
+				}
+
+				switch {
+				case ok:
+					// A single-instance override replaces exactly this slot,
+					// and is emitted at its own DTSTART. It beats a range edit:
+					// naming one occurrence is the more specific statement.
 					if seenOverrides[tpl.base.UID] == nil {
 						seenOverrides[tpl.base.UID] = make(map[time.Time]bool)
 					}
-					seenOverrides[tpl.base.UID][inst] = true
-					if e, ok := materialize(ov, ov.start, true); ok && overlaps(e, windowStart, windowEnd) {
-						events = append(events, e)
-					}
-					continue
+					seenOverrides[tpl.base.UID][key] = true
+					source, start = ov, ov.start
+				case governed:
+					// RANGE=THISANDFUTURE: the edit owns this occurrence and
+					// every later one, moved by however far it moved its own.
+					source, start = gov, occ.Add(gov.shift())
 				}
 			}
 
-			e, ok := materialize(tpl, occ, tpl.rrule != "")
+			e, ok := materialize(source, start, tpl.rrule != "" || len(tpl.rdates) > 0)
 			if !ok || !overlaps(e, windowStart, windowEnd) {
 				continue
 			}
@@ -176,11 +333,21 @@ func Parse(data []byte, startDate, endDate *time.Time) ([]Event, error) {
 
 	// Overrides whose master series is absent, or whose instant was moved
 	// outside the expansion window, still represent real events.
-	for uid, byInstant := range overrides {
-		for inst, ov := range byInstant {
+	for uid, set := range overrides {
+		for inst, ov := range set.single {
 			if seenOverrides[uid][inst] {
 				continue
 			}
+			if e, ok := materialize(ov, ov.start, true); ok && overlaps(e, windowStart, windowEnd) {
+				events = append(events, e)
+			}
+		}
+		// A THISANDFUTURE override is normally materialized through the
+		// occurrences it governs. With no series to govern, it is just an event.
+		if hasMaster[uid] {
+			continue
+		}
+		for _, ov := range set.future {
 			if e, ok := materialize(ov, ov.start, true); ok && overlaps(e, windowStart, windowEnd) {
 				events = append(events, e)
 			}
@@ -193,6 +360,15 @@ func Parse(data []byte, startDate, endDate *time.Time) ([]Event, error) {
 		}
 		return events[i].Start.Before(events[j].Start)
 	})
+
+	// A zone that could not be placed produced times from the local fallback,
+	// which look ordinary and are wrong by whatever the offsets differ by. Said
+	// once per calendar rather than per event.
+	if unresolved := tz.Unresolved(); len(unresolved) > 0 {
+		log.WithField("tzids", unresolved).Warn(
+			"calendar names timezones that are neither IANA nor defined in the feed; " +
+				"their events fall back to the server's local time")
+	}
 
 	return events, nil
 }
@@ -250,6 +426,15 @@ func buildTemplate(event *ics.VEvent, tz *tzResolver) (*eventTemplate, error) {
 	tpl.start = start
 	tpl.base.AllDay = allDay
 
+	// Only a zoned date-time repeats on a wall clock. A UTC value genuinely
+	// repeats on the timeline, and a floating one is already resolved against
+	// time.Local, which tracks its own transitions.
+	if tpl.tzid = paramTZID(dtstart); tpl.tzid != "" {
+		if wall, ok := wallClock(dtstart.Value); ok {
+			tpl.startWall, tpl.wallBased = wall, true
+		}
+	}
+
 	// Duration comes from DTEND, or DURATION, or defaults by event kind.
 	tpl.duration = eventDuration(event, start, allDay, tz)
 
@@ -257,6 +442,7 @@ func buildTemplate(event *ics.VEvent, tz *tzResolver) (*eventTemplate, error) {
 		if rid, _, err := parseDateTime(p.Value, paramTZID(p), tz); err == nil {
 			tpl.recurrenceID = rid
 			tpl.hasRecurID = true
+			tpl.thisAndFuture = strings.EqualFold(paramValue(p, "RANGE"), "THISANDFUTURE")
 		}
 	}
 
@@ -287,11 +473,29 @@ func buildTemplate(event *ics.VEvent, tz *tzResolver) (*eventTemplate, error) {
 	return tpl, nil
 }
 
+// wallClock reads the local date-time form, the only one that carries a wall
+// clock needing a zone to place it. Date-only and UTC values are rejected.
+func wallClock(value string) (time.Time, bool) {
+	value = strings.TrimSpace(value)
+	if len(value) == 8 || strings.HasSuffix(value, "Z") {
+		return time.Time{}, false
+	}
+	t, err := time.ParseInLocation("20060102T150405", value, time.UTC)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return t, true
+}
+
 func paramTZID(prop *ics.IANAProperty) string {
+	return paramValue(prop, string(ics.PropertyTzid))
+}
+
+func paramValue(prop *ics.IANAProperty, name string) string {
 	if prop == nil {
 		return ""
 	}
-	if vals, ok := prop.ICalParameters[string(ics.PropertyTzid)]; ok && len(vals) > 0 {
+	if vals, ok := prop.ICalParameters[name]; ok && len(vals) > 0 {
 		return vals[0]
 	}
 	return ""
@@ -415,37 +619,23 @@ func parseICalDuration(s string) (time.Duration, error) {
 	return total, nil
 }
 
+// pad is how far outside a window a wall-clock expansion has to reach: enough
+// for any zone offset, generously rounded up, plus the event's own length so an
+// occurrence starting before the window but running into it is still produced.
+func pad(duration time.Duration) time.Duration { return duration + 36*time.Hour }
+
 // expand returns the start instants of a template within the window, honouring
 // RRULE, RDATE and EXDATE.
-func expand(tpl *eventTemplate, windowStart, windowEnd time.Time) []time.Time {
-	if tpl.rrule == "" && len(tpl.rdates) == 0 {
-		if tpl.exdates[tpl.start.UTC()] {
-			return nil
-		}
-		return []time.Time{tpl.start}
-	}
-
+func expand(tpl *eventTemplate, tz *tzResolver, windowStart, windowEnd time.Time) []time.Time {
 	var out []time.Time
 	if tpl.rrule != "" {
-		opt, err := rrule.StrToROption(tpl.rrule)
-		if err != nil {
-			// An unparseable rule still has a real first occurrence.
-			return []time.Time{tpl.start}
-		}
-		opt.Dtstart = tpl.start
-		rr, err := rrule.NewRRule(*opt)
-		if err != nil {
-			return []time.Time{tpl.start}
-		}
-		// Widen the query by the event duration so a series occurrence that
-		// starts before the window but runs into it is still produced.
-		queryStart := windowStart.Add(-tpl.duration)
-		for _, t := range rr.Between(queryStart, windowEnd, true) {
-			out = append(out, t)
-			if len(out) >= maxOccurrencesPerSeries {
-				break
-			}
-		}
+		out = tpl.expandRule(tz, windowStart, windowEnd)
+	} else {
+		// RFC 5545 §3.8.5.2: the recurrence set is DTSTART together with RRULE
+		// and RDATE, minus EXDATE. DTSTART belongs to it even when RDATE is the
+		// only recurrence property, and an event carrying RDATE alone otherwise
+		// loses the occurrence it was written for.
+		out = append(out, tpl.start)
 	}
 	out = append(out, tpl.rdates...)
 
@@ -460,6 +650,68 @@ func expand(tpl *eventTemplate, windowStart, windowEnd time.Time) []time.Time {
 		filtered = append(filtered, t)
 	}
 	return filtered
+}
+
+// expandRule materializes the occurrences of an RRULE inside the window.
+//
+// A series written in a named zone repeats on the wall clock, not on the
+// timeline: a 10:00 standup is at 10:00 either side of a DST transition. So it
+// is expanded in wall-clock space and each occurrence placed afterwards, asking
+// the zone which offset applied on that occurrence's own date.
+//
+// Expanding from the resolved instant instead pins every occurrence to the
+// offset in force when the series began. That is invisible for a zone that
+// resolves to an IANA location, because rrule then repeats on that location's
+// wall clock anyway — and wrong for one resolved from the feed's own VTIMEZONE,
+// which can only be represented as a fixed offset.
+func (tpl *eventTemplate) expandRule(tz *tzResolver, windowStart, windowEnd time.Time) []time.Time {
+	opt, err := rrule.StrToROption(tpl.rrule)
+	if err != nil {
+		// An unparseable rule still has a real first occurrence.
+		return []time.Time{tpl.start}
+	}
+
+	opt.Dtstart = tpl.start
+	if tpl.wallBased {
+		opt.Dtstart = tpl.startWall
+	}
+
+	// UNTIL is defined in UTC even when DTSTART is a local time, so during a
+	// wall-clock expansion rrule would be comparing two different clocks and
+	// end the series off by the zone's offset — keeping a trailing occurrence
+	// west of UTC, dropping a real final one east of it. The bound is lifted
+	// out of rrule's hands and applied below to the placed instant, which is
+	// the thing UNTIL actually describes.
+	until := opt.Until
+	if tpl.wallBased && !until.IsZero() {
+		opt.Until = until.Add(pad(tpl.duration))
+	}
+
+	rr, err := rrule.NewRRule(*opt)
+	if err != nil {
+		return []time.Time{tpl.start}
+	}
+
+	queryStart, queryEnd := windowStart.Add(-tpl.duration), windowEnd
+	if tpl.wallBased {
+		queryStart, queryEnd = windowStart.Add(-pad(tpl.duration)), windowEnd.Add(pad(tpl.duration))
+	}
+
+	var out []time.Time
+	for _, t := range rr.Between(queryStart, queryEnd, true) {
+		at := t
+		if tpl.wallBased {
+			at = tz.resolveWall(t, tpl.tzid)
+		}
+		if !until.IsZero() && at.After(until) {
+			continue
+		}
+		out = append(out, at)
+		if len(out) >= maxOccurrencesPerSeries {
+			break
+		}
+	}
+	return out
 }
 
 // materialize produces a concrete Event for one occurrence instant.
