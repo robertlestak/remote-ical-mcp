@@ -6,6 +6,7 @@ import (
 	"os"
 
 	"github.com/robertlestak/remote-ical-mcp/internal/config"
+	"github.com/robertlestak/remote-ical-mcp/internal/ical"
 	"github.com/robertlestak/remote-ical-mcp/internal/mcp"
 	log "github.com/sirupsen/logrus"
 )
@@ -30,9 +31,13 @@ func main() {
 		l.WithError(err).Fatal("failed to load config")
 	}
 
-	calendars := make(map[string]string)
+	calendars := make([]ical.RemoteCalendar, 0, len(cfg.Calendars))
 	for _, cal := range cfg.Calendars {
-		calendars[cal.Name] = cal.URL
+		calendars = append(calendars, ical.RemoteCalendar{
+			Name:        cal.Name,
+			Description: cal.Description,
+			URL:         cal.URL,
+		})
 	}
 
 	server, err := mcp.NewServer(calendars)
@@ -52,4 +57,3 @@ func main() {
 		}
 	}
 }
-

@@ -1,5 +1,7 @@
 calendars:
   - name: work
+    description: Work calendar
     url: https://outlook.office365.com/owa/calendar/example/calendar.ics
   - name: personal
+    description: Personal calendar
     url: https://example.com/personal-calendar.ics
