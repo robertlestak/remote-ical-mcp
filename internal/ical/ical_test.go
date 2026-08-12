@@ -105,6 +105,50 @@ func TestUnknownTimezoneFallsBackToVTimezone(t *testing.T) {
 	}
 }
 
+// TestVTimezoneFallbackIsDSTAware guards against reading a zone name such as
+// "Pacific Standard Time" as the fixed offset -0800. The name identifies a zone
+// that observes both PST and PDT, and the feed's own VTIMEZONE says so. Uses an
+// unmapped TZID so resolution is forced down the VTIMEZONE fallback path.
+func TestVTimezoneFallbackIsDSTAware(t *testing.T) {
+	// The DST rules Exchange emits for "Pacific Standard Time", verbatim.
+	vtz := "BEGIN:VTIMEZONE\r\nTZID:Unmapped Pacific\r\n" +
+		"BEGIN:STANDARD\r\nDTSTART:16010101T020000\r\nTZOFFSETFROM:-0700\r\nTZOFFSETTO:-0800\r\n" +
+		"RRULE:FREQ=YEARLY;INTERVAL=1;BYDAY=1SU;BYMONTH=11\r\nEND:STANDARD\r\n" +
+		"BEGIN:DAYLIGHT\r\nDTSTART:16010101T020000\r\nTZOFFSETFROM:-0800\r\nTZOFFSETTO:-0700\r\n" +
+		"RRULE:FREQ=YEARLY;INTERVAL=1;BYDAY=2SU;BYMONTH=3\r\nEND:DAYLIGHT\r\n" +
+		"END:VTIMEZONE\r\n"
+
+	tests := []struct {
+		name       string
+		dtstart    string
+		want       string
+		start, end string
+	}{
+		// Daylight runs from the 2nd Sunday in March to the 1st Sunday in November.
+		{"august is daylight", "20260811T073000", "2026-08-11T14:30:00Z", "2026-08-01T00:00:00Z", "2026-09-01T00:00:00Z"},
+		{"july is daylight", "20260715T073000", "2026-07-15T14:30:00Z", "2026-07-01T00:00:00Z", "2026-08-01T00:00:00Z"},
+		{"december is standard", "20261215T073000", "2026-12-15T15:30:00Z", "2026-12-01T00:00:00Z", "2027-01-01T00:00:00Z"},
+		{"january is standard", "20260115T073000", "2026-01-15T15:30:00Z", "2026-01-01T00:00:00Z", "2026-02-01T00:00:00Z"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			data := wrap(vtz, event(
+				"UID:dstfb-1",
+				"SUMMARY:commute",
+				"DTSTART;TZID=Unmapped Pacific:"+tc.dtstart,
+				"DTEND;TZID=Unmapped Pacific:"+tc.dtstart,
+			))
+			events := mustParse(t, data, tc.start, tc.end)
+			if len(events) != 1 {
+				t.Fatalf("got %d events, want 1", len(events))
+			}
+			if got := events[0].Start.UTC().Format(time.RFC3339); got != tc.want {
+				t.Errorf("start = %s, want %s", got, tc.want)
+			}
+		})
+	}
+}
+
 // TestRecurringExpansion covers the bug where an RRULE series appeared only at
 // its original DTSTART, so weekly meetings vanished from any later window.
 func TestRecurringExpansion(t *testing.T) {

@@ -159,7 +159,7 @@ type tzTransition struct {
 	offset     int // seconds east of UTC, from TZOFFSETTO
 	name       string
 	start      time.Time // DTSTART, interpreted as wall-clock in the preceding offset
-	rule       *rrule.RRule
+	opt        *rrule.ROption
 	isDaylight bool
 }
 
@@ -231,12 +231,11 @@ func parseVTimezone(vtz *ics.VTimezone) *vtimezone {
 				t.start = start
 			}
 		}
+		// The rule is stored unbuilt: its DTSTART has to be re-anchored per
+		// query, see latestOccurrence.
 		if p := base.GetProperty(ics.ComponentPropertyRrule); p != nil {
 			if ro, err := rrule.StrToROption(p.Value); err == nil {
-				ro.Dtstart = t.start
-				if rr, err := rrule.NewRRule(*ro); err == nil {
-					t.rule = rr
-				}
+				t.opt = ro
 			}
 		}
 		out.transitions = append(out.transitions, t)
@@ -278,6 +277,44 @@ func parseUTCOffset(s string) (int, error) {
 	return sign * (h*3600 + m*60 + sec), nil
 }
 
+// latestOccurrence returns the most recent time this transition fires at or
+// before wall.
+//
+// The rule is re-anchored rather than started from its own DTSTART. Microsoft
+// emits DTSTART:16010101T000000 in every VTIMEZONE, and rrule-go yields no
+// occurrences at all for a DTSTART that far back, which previously made every
+// transition invisible and pinned such zones to their standard-time offset
+// year round. BYMONTH and BYDAY fully determine the date, so the anchor year is
+// immaterial as long as it precedes the query; only the clock time carries over.
+func (t tzTransition) latestOccurrence(wall time.Time) (time.Time, bool) {
+	if t.opt == nil {
+		if t.start.IsZero() || t.start.After(wall) {
+			return time.Time{}, false
+		}
+		return t.start, true
+	}
+
+	h, m, s := 0, 0, 0
+	if !t.start.IsZero() {
+		h, m, s = t.start.Clock()
+	}
+	anchor := time.Date(wall.Year()-1, time.January, 1, h, m, s, 0, time.UTC)
+
+	opt := *t.opt
+	opt.Dtstart = anchor
+	rr, err := rrule.NewRRule(opt)
+	if err != nil {
+		return time.Time{}, false
+	}
+	// A full year of lookback guarantees at least one occurrence of an annual
+	// rule at or before wall.
+	window := rr.Between(anchor, wall, true)
+	if len(window) == 0 {
+		return time.Time{}, false
+	}
+	return window[len(window)-1], true
+}
+
 // offsetAt returns the UTC offset this VTIMEZONE defines for the given wall-clock
 // time, by finding the most recent transition occurring at or before it.
 func (v *vtimezone) offsetAt(wall time.Time) int {
@@ -286,19 +323,9 @@ func (v *vtimezone) offsetAt(wall time.Time) int {
 	found := false
 
 	for _, t := range v.transitions {
-		var occ time.Time
-		if t.rule != nil {
-			// Look back a year to catch the transition currently in effect.
-			window := t.rule.Between(wall.AddDate(-1, 0, 0), wall, true)
-			if len(window) == 0 {
-				continue
-			}
-			occ = window[len(window)-1]
-		} else {
-			if t.start.IsZero() || t.start.After(wall) {
-				continue
-			}
-			occ = t.start
+		occ, ok := t.latestOccurrence(wall)
+		if !ok {
+			continue
 		}
 		if !found || occ.After(bestTime) {
 			best, bestTime, found = t.offset, occ, true
